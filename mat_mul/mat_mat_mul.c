@@ -20,6 +20,8 @@ typedef double* PFT;
 #define WRITE_SPEED 2147483648LL // 2G Bytes
 #define MEMORY_SIZE 1073741824LL // 1G
 #define SWELL_FACTOR 1.1
+#define WRITE_BLOCK_MAX 2147483647LL
+#define READ_BLOCK_MAX 1073741824LL
 
 #define DOUBLE_MOD (1e+300)
 #define THREAD_NUMS 24
@@ -36,7 +38,6 @@ typedef struct FileCache {
 	FILE* fhA;
 	FILE* fhB;
 	FILE* fhC;
-	FileCache(): fhA(NULL), fhB(NULL), fhC(NULL){}
 } FileCache;
 
 typedef struct MatrixDisk {
@@ -46,11 +47,14 @@ typedef struct MatrixDisk {
 	PFT A2;
 	PFT B2;
 	PFT C2;
-	MatrixDisk() : A(NULL), B(NULL), C(NULL), A2(NULL), B2(NULL), C2(NULL){}
 } MatrixDisk;
 
-static FileCache mat_file_cache;
-static MatrixDisk mat_disk;
+static FileCache mat_file_cache = {
+	NULL, NULL, NULL
+};
+static MatrixDisk mat_disk = {
+	NULL, NULL, NULL, NULL, NULL, NULL
+};
 static FT BP[KC * NC] __attribute__ ((aligned (32)));
 static FT ABArray[MC * KC * THREAD_NUMS] __attribute__ ((aligned (32)));
 const char* CACHE_FILE_NAME_A = "cacheA";
@@ -60,7 +64,6 @@ static omp_lock_t read_lock;
 static omp_lock_t change_lock;
 static int NEXT_A_PANEL = 1;
 
-#pragma vector aligned
 void BPanel_kcnc(FT B[restrict], const int kc, const int nc, FT BP[restrict], const int n)
 {
 	int i, j, jr;
@@ -69,6 +72,7 @@ void BPanel_kcnc(FT B[restrict], const int kc, const int nc, FT BP[restrict], co
 	{
 		for(i = 0; i < kc; ++i)
 		{
+#pragma vector aligned
 			for(j = 0; j < NR; ++j){
 				BP[j] = B[j*n];
 			}
@@ -188,7 +192,6 @@ void mat_v_v(const FT AV[restrict], const FT BV[restrict], FT C[restrict], const
 
 }
 
-#pragma vector aligned
 void mat_block_panel(const FT AB[restrict], const FT BP[restrict], FT C[restrict],
 		const int mc, const int kc, const int nc, const int n)
 {
@@ -216,6 +219,7 @@ void mat_block_panel(const FT AB[restrict], const FT BP[restrict], FT C[restrict
 				int i,j;
 				for(j = 0; j < nr; ++j)
 				{
+#pragma vector aligned
 					for(i = 0; i < mr; ++i)
 					{
 						p[i + j*n] += TMPC[i + j*MR];
@@ -267,8 +271,9 @@ void mat_mat_mul(FT A[restrict], FT B[restrict], FT C[restrict], const int n)
 void mat_mat_mul_disk(MatrixDisk* m,  const int n, const int WBC, const int WA)
 {
 	int threads = omp_get_num_procs();
+	int thread_id = 0;
 	int ic, jc, lc, nc, mc, kc, wac, wc;
-	int nb = (WBC+NC-1)/NC, rn = W % NC;
+	int nb = (WBC+NC-1)/NC, rn = WBC % NC;
 	int mb = (n+MC-1)/MC, rm = n % MC;
 	int kb, rk;
 	int wab = (n+WA-1)/WA, rwa = n % WA; // WA must be divided by KC
@@ -314,7 +319,7 @@ void mat_mat_mul_disk(MatrixDisk* m,  const int n, const int WBC, const int WA)
 					NEXT_A_PANEL = (NEXT_A_PANEL < wab-1) ? (NEXT_A_PANEL+1) : 0;
 				}
 				omp_unset_lock(&read_lock);
-				omp_unset_change(&change_lock);
+				omp_unset_lock(&change_lock);
 			}
 
 			for(lc = 0; lc < kb; ++lc)
@@ -336,7 +341,6 @@ void mat_mat_mul_disk(MatrixDisk* m,  const int n, const int WBC, const int WA)
 	}
 }
 
-#pragma vector aligned
 void print_matrix(FT A[restrict], int n)
 {
 	int i, j;
@@ -349,7 +353,6 @@ void print_matrix(FT A[restrict], int n)
 		printf("\n");
 	}
 }
-#pragma vector aligned
 void init_matrix_offset(FT A[restrict], int m, int n, int si, int sj, int flag)
 {
 	int i, j;
@@ -357,6 +360,7 @@ void init_matrix_offset(FT A[restrict], int m, int n, int si, int sj, int flag)
 	{
 		for(j = 0; j < n; ++j)
 		{
+			#pragma vector aligned
 			for(i = 0; i < m; ++i)
 			{
 				A[I(i,j,m)] = 0.0;
@@ -367,6 +371,7 @@ void init_matrix_offset(FT A[restrict], int m, int n, int si, int sj, int flag)
 	{
 		for(j = 0; j < n; ++j)
 		{
+			#pragma vector aligned
 			for(i = 0; i < m; ++i)
 			{
 				A[I(i,j,m)] = fmod((i+si)*(j+sj)*1.0, 10.0) + 1;
@@ -375,27 +380,43 @@ void init_matrix_offset(FT A[restrict], int m, int n, int si, int sj, int flag)
 	}
 }
 
-void init_matrix(FT A[restrict], int m, int n, int flag)
+void init_matrix_rectangle(PFT A, int m, int n, int flag)
 {
 	init_matrix_offset(A, m, n, 0, 0, flag);
 }
 
-void init_matrix(FT A[restrict], int n, int flag)
+void init_matrix(PFT A, int n, int flag)
 {
-	init_matrix(A, n, n, 0, 0, flag);
+	init_matrix_offset(A, n, n, 0, 0, flag);
 }
 
-bool write_matrix(FT A, int m, int n, FILE* fh, long offset)
+int write_matrix(PFT A, int m, int n, FILE* fh, long offset)
 {
+	if(offset != 0)
+		fseek(fh, offset, SEEK_SET);
+	long long size = (long long)m * (long long)n * 8L;
+	char* ptr = (char*)A;
+	while(size > 0)
+	{
+		fwrite(ptr, sizeof(char), ((size > WRITE_BLOCK_MAX) ? WRITE_BLOCK_MAX : size), fh);
+		size -= WRITE_BLOCK_MAX;
+	}
 	
 }
-bool read_matrix(FT M, int m, int n, FILE* fh, long offset)
+int read_matrix(PFT M, int m, int n, FILE* fh, long offset)
 {
-
+	if(offset != 0)
+		fseek(fh, offset, SEEK_SET);
+	long long size = (long long)m * (long long)n;
+	char* ptr = (char*)M;
+	while(size > 0)
+	{
+		fread(ptr, sizeof(char), ((size > READ_BLOCK_MAX) ? READ_BLOCK_MAX : size), fh);
+		size -= WRITE_BLOCK_MAX;
+	}
 }
 
 
-#pragma vector aligned
 void init_matrix_disk(MatrixDisk* m, int n, int WBC, int WA)
 {
 	mat_file_cache.fhA = fopen(CACHE_FILE_NAME_A, "wb");
@@ -406,7 +427,7 @@ void init_matrix_disk(MatrixDisk* m, int n, int WBC, int WA)
 		{
 			#pragma omp section //init matirx A
 			{
-				init_matrix(m->A, n, WA, 1);
+				init_matrix_rectangle(m->A, n, WA, 1);
 				write_matrix(m->A, n, WA, mat_file_cache.fhA, 0);
 				int i, wt;
 				int wb = (n+WA-1)/WA, rw = n % WA;
@@ -419,7 +440,7 @@ void init_matrix_disk(MatrixDisk* m, int n, int WBC, int WA)
 			}
 			#pragma omp section //init matrix B
 			{
-				init_matrix(m->B, n, WBC, 1);
+				init_matrix_rectangle(m->B, n, WBC, 1);
 				write_matrix(m->B, n, WBC, mat_file_cache.fhB, 0);
 				int i, wt;
 				int wb = (n+WBC-1)/WBC, rw = n % WBC;
@@ -432,8 +453,8 @@ void init_matrix_disk(MatrixDisk* m, int n, int WBC, int WA)
 			}
 			#pragma omp section
 			{
-				init_matrix(m->C, n, WBC, 0);
-				init_matrix(m->C2, n, WBC, 0);
+				init_matrix_rectangle(m->C, n, WBC, 0);
+				init_matrix_rectangle(m->C2, n, WBC, 0);
 			}
 		}
 	}
@@ -443,7 +464,6 @@ void init_matrix_disk(MatrixDisk* m, int n, int WBC, int WA)
 	mat_file_cache.fhB = NULL;
 }
 
-#pragma vector aligned
 double sumMatirx(FT M[restrict], int m, int n)
 {
 	int i, j;
@@ -460,14 +480,13 @@ double sumMatirx(FT M[restrict], int m, int n)
 
 }
 
-bool checkMatrixSize(int n)
+int checkMatrixSize(int n)
 {
 	return (double)n * (double)n * 3 * 8 * SWELL_FACTOR < MEMORY_SIZE;
 }
 
 void matrix_in_memory(int n)
 {
-	int n = 8192;
 	int i;
 	int loopcnt = 1;
 	double tc, tc2;
@@ -516,7 +535,7 @@ void matrix_in_memory(int n)
 
 }
 
-void matrix_in_memory_disk(n)
+void matrix_in_memory_disk(int n)
 {
 	// partition C, B, W need to be divided by NC
 	int WBC = MEMORY_SIZE/(8L * 6L * n); //width of C, B to calculate 
@@ -533,6 +552,10 @@ void matrix_in_memory_disk(n)
 	// partition A, WA need to be divided by KC, and WA >= 2*KC
 	int WA = (WBC/KC)*KC;
 
+#ifdef PRINT_DEBUG
+	printf("parameters ==> n: %d, WBC: %d, mWb: %d, WA: %d\n\n", n, WBC, mWb, WA);
+#endif
+
 	mat_disk.A = _mm_malloc(WA*n*sizeof(FT), 32);
 	mat_disk.B = _mm_malloc(WBC*n*sizeof(FT), 32);
 	mat_disk.C = _mm_malloc(WBC*n*sizeof(FT), 32);
@@ -548,7 +571,7 @@ void matrix_in_memory_disk(n)
 
 	//open nested
 	omp_set_nested(1);
-	#pragma omp parallel num_threads(2);
+	#pragma omp parallel num_threads(2)
 	{
 		#pragma omp sections 
 		{
@@ -659,13 +682,13 @@ void matrix_in_memory_disk(n)
 	}
 
 
-	_mm_free(A);
-	_mm_free(B);
-	_mm_free(C);
+	_mm_free(mat_disk.A);
+	_mm_free(mat_disk.B);
+	_mm_free(mat_disk.C);
 	
-	_mm_free(A2);
-	_mm_free(B2);
-	_mm_free(C2);
+	_mm_free(mat_disk.A2);
+	_mm_free(mat_disk.B2);
+	_mm_free(mat_disk.C2);
 
 }
 
@@ -681,13 +704,13 @@ int main()
 	{
 		omp_init_lock(&read_lock);
 		omp_init_lock(&change_lock);
-		matirx_in_memory_disk(n);
+		matrix_in_memory_disk(n);
 		if(mat_file_cache.fhA)
-			fclose(fhA);
+			fclose(mat_file_cache.fhA);
 		if(mat_file_cache.fhB)
-			fclose(fhB);
+			fclose(mat_file_cache.fhB);
 		if(mat_file_cache.fhC)
-			fclose(fhC);
+			fclose(mat_file_cache.fhC);
 		omp_destroy_lock(&read_lock);
 	}
 
