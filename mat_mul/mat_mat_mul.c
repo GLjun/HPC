@@ -66,7 +66,7 @@ const char* CACHE_FILE_NAME_B = "cacheB";
 const char* CACHE_FILE_NAME_C = "cacheC";
 static omp_lock_t read_lock;
 static omp_lock_t change_lock;
-static int NEXT_A_PANEL = 1;
+static int READ_A_PANEL_INDEX = 0;
 
 void BPanel_kcnc(FT B[restrict], const int kc, const int nc, FT BP[restrict], const int n)
 {
@@ -274,7 +274,7 @@ void mat_mat_mul(FT A[restrict], FT B[restrict], FT C[restrict], const int n)
 
 void mat_mat_mul_disk(MatrixDisk* m,  const int n, const int WBC, const int WA)
 {
-	int threads = omp_get_num_procs();
+	int threads = omp_get_num_procs() - 1;
 	int thread_id = 0;
 	int ic, jc, lc, nc, mc, kc, wac, wc;
 	int nb = (WBC+NC-1)/NC, rn = WBC % NC;
@@ -306,12 +306,12 @@ void mat_mat_mul_disk(MatrixDisk* m,  const int n, const int WBC, const int WA)
 			{
 				omp_set_lock(&change_lock);		
 
-				if(NEXT_A_PANEL == wac)
-				{
+				//if(READ_A_PANEL == wac)
+				//{
 					tmp = m->A;
 					m->A = m->A2;
 					m->A2 = tmp;
-					if(!wac)
+					if(!wac) //Since the first time "wac == 0" is included, so we need to exchange B/B2, C/C2 at the beginning
 					{
 						tmp = m->B;
 						m->B = m->B2;
@@ -320,8 +320,9 @@ void mat_mat_mul_disk(MatrixDisk* m,  const int n, const int WBC, const int WA)
 						m->C = m->C2;
 						m->C2 = tmp;
 					}
-					NEXT_A_PANEL = (NEXT_A_PANEL < wab-1) ? (NEXT_A_PANEL+1) : 0;
-				}
+					//READ_A_PANEL_INDEX = (READ_A_PANEL_INDEX < wab-1) ? (READ_A_PANEL_INDEX+1) : 0;
+					READ_A_PANEL_INDEX = (wac != wab-1) ? (wac+1) : 0;
+				//}
 				omp_unset_lock(&read_lock);
 				omp_unset_lock(&change_lock);
 			}
@@ -572,6 +573,16 @@ void matrix_in_memory_disk(int n)
 	
 	//lock, so the first lock in IO loop will wait
 	omp_set_lock(&read_lock);
+	//exchange A/A2, B/B2, C/C2 for mat_mat_mul_disk, because every time wac == 0, those matrix will be exchanged
+	PFT t = mat_disk.A;
+	mat_disk.A = mat_disk.A2;
+	mat_disk.A2 = t;
+	t = mat_disk.B;
+	mat_disk.B = mat_disk.B2;
+	mat_disk.B2 = t;
+	t = mat_disk.C;
+	mat_disk.C = mat_disk.C2;
+	mat_disk.C2 = t;
 
 	//open nested
 	omp_set_nested(1);
@@ -585,21 +596,25 @@ void matrix_in_memory_disk(int n)
 				mat_file_cache.fhA = fopen(CACHE_FILE_NAME_A, "rb");
 				mat_file_cache.fhB = fopen(CACHE_FILE_NAME_B, "rb");
 				mat_file_cache.fhC = fopen(CACHE_FILE_NAME_C, "wb");
-				//fseek B, go over the first panel
+				//fseek B, go over the first panel WBC*n
 				fseek(mat_file_cache.fhB, WBC * n * sizeof(FT), SEEK_SET);
-				int i, j, wc, wa, cb, cc;
+				//fseek A, go over the first panel WA*n
+				fseek(mat_file_cache.fhA, WA * n * sizeof(FT), SEEK_SET);
+				int i_b, i_c, j, wc, wa, c_in_b2, cc, k;
 				int wb = (n+WBC-1)/WBC, rw = n % WBC;
 				int wab = (n + WA -1 )/WA, rwa = n % WA; //WA must be divided by KC
 				int we = (rwa != 0) ? (WBC + wab - 2) / (wab - 1) : (WBC + wab -1)/wab;
 				
 				
 
-				i = 1; // the index of panel B/C
+				i_b = 1; // the index of panel B/C
+				i_c = 0;
 				wc = WBC;
-				cb = 0;
+				c_in_b2= 0;// columns in b2 
+				k = 0;
 				PFT pB = mat_disk.B2;
 				PFT pC = mat_disk.C2;
-				while(NEXT_A_PANEL < wab && i < wb)
+				while(i_c < wb-1)
 				{
 					omp_set_lock(&read_lock);
 					//lock change
@@ -608,67 +623,63 @@ void matrix_in_memory_disk(int n)
 					printf("\n Begin IO\n");
 #endif
 				
-					wa = (NEXT_A_PANEL != wab - 1 || !rwa) ? WA : rwa;
+					wa = (READ_A_PANEL_INDEX != wab - 1 || !rwa) ? WA : rwa;
 #ifdef PRINT_DEBUG
-					printf("read row:%d, cl:%d, to matirxA\n", n, wa);
+					printf("read panel of A, index:%d, row:%d, cl:%d\n", READ_A_PANEL_INDEX, n, wa);
 #endif
+					if(READ_A_PANEL_INDEX == 0) // reset the file pointer to the beginning
+						fseek(mat_file_cache.fhA, 0, SEEK_SET);
 					//read panel of A to A2
-					read_matrix(mat_disk.A2, n, wa, mat_file_cache.fhA, 0);
+					read_matrix(&mat_disk.A2[READ_A_PANEL_INDEX*WA*n], n, wa, mat_file_cache.fhA, 0);
 
 					//read panel of panel of B to B2 and write panel of panel of C to File
-					if(cb < wc) 
+					if(c_in_b2 < wc) 
 					{
-						if(cb + we <= wc)
+						k = (c_in_b2 + we <= wc) ? we : (wc - c_in_b2);
+						if(i_b < wb) // the last iteration do not need read B
 						{
 #ifdef PRINT_DEBUG
-							printf("read row:%d, cl:%d, to fileB\n", n, we);
+							printf("read panel of panel of B, from %d, row:%d, cl:%d, to fileB\n", c_in_b2, n, k);
 #endif
-							read_matrix(pB, n, we, mat_file_cache.fhB, 0);
-							pB += (long long)n *(long long)we;
-#ifdef PRINT_DEBUG
-							printf("write :%d, cl:%d, to fileC\n", n, we);
-#endif
-							write_matrix(pC, n, we, mat_file_cache.fhC, 0);
-							pC += (long long)n *(long long)we;
+							read_matrix(&mat_disk.B2[c_in_b2*n], n, k, mat_file_cache.fhB, 0);
 
-							cb += we;
 						}
-						else
+						if(i_b > 1) // write C from after the first panel of B being calculated
 						{
 #ifdef PRINT_DEBUG
-							printf("read row:%d, cl:%d, to fileB\n", n, wc-cb);
+							printf("write and memset panel of panel of C, from %d, row:%d, cl:%d, to fileC\n", c_in_b2, n, k);
 #endif
-							read_matrix(pB, n, wc-cb, mat_file_cache.fhB, 0);
-							pB += (long long)n *(long long)(wc-cb);
-#ifdef PRINT_DEBUG
-							printf("write :%d, cl:%d, to fileC\n", n, wc-cb);
-#endif
-							write_matrix(pC, n, wc-cb, mat_file_cache.fhC, 0);
-							pC += (long long)n *(long long)(wc-cb);
-
-							cb = wc;
+							write_matrix(&mat_disk.C2[c_in_b2*n], n, k, mat_file_cache.fhC, 0);
+							memset((void*)(&mat_disk.C2[c_in_b2*n]), 0, n*k*sizeof(FT));
+							
 						}
+						c_in_b2 += k;
+						
 					}
 
 					
 
-					if(NEXT_A_PANEL == wab - 1)
+					if(READ_A_PANEL_INDEX == 0)
 					{
-						++ i;
-						wc = (i != wb -1 || !rw) ? WBC : rw;
-						cb = 0;
+						if(i_b > 1)
+							++ i_c;
+						++ i_b;
+						wc = (i_b != wb -1 || !rw) ? WBC : rw;
+						c_in_b2 = 0;
 #ifdef PRINT_DEBUG
-						printf("next iteration, i/wb: %d/%d, wc: %d\n", i, wb, wc);
+						printf("next iteration, i_b/wb: %d/%d, wc: %d\n", i_b, wb, wc);
 #endif
 					}
 					omp_unset_lock(&change_lock);
 				}
-				fflush(mat_file_cache.fhA);
-				fflush(mat_file_cache.fhB);
-				fflush(mat_file_cache.fhC);
-				fclose(mat_file_cache.fhA);
-				fclose(mat_file_cache.fhB);
-				fclose(mat_file_cache.fhC);
+				
+				printf("finish calculating!!!!!!!!!\n");
+				//fflush(mat_file_cache.fhA);
+				//fflush(mat_file_cache.fhB);
+				//fflush(mat_file_cache.fhC);
+				//fclose(mat_file_cache.fhA);
+				//fclose(mat_file_cache.fhB);
+				//fclose(mat_file_cache.fhC);
 
 			}
 
@@ -699,6 +710,15 @@ void matrix_in_memory_disk(int n)
 
 		}
 	}
+	//write last panel C;
+	int lpw = (n % WBC == 0) ? WBC : (n % WBC);
+	write_matrix(mat_disk.C, n, lpw, mat_file_cache.fhC, 0);
+	fflush(mat_file_cache.fhA);
+	fflush(mat_file_cache.fhB);
+	fflush(mat_file_cache.fhC);
+	fclose(mat_file_cache.fhA);
+	fclose(mat_file_cache.fhB);
+	fclose(mat_file_cache.fhC);
 
 
 	_mm_free(mat_disk.A);
@@ -731,6 +751,7 @@ int main()
 		if(mat_file_cache.fhC)
 			fclose(mat_file_cache.fhC);
 		omp_destroy_lock(&read_lock);
+		omp_destroy_lock(&change_lock);
 	}
 
 	
