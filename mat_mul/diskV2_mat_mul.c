@@ -14,11 +14,16 @@
 typedef double FT;
 typedef double* PFT;
 
+#define CACHE_FILE_A "cacheA"
+#define CACHE_FILE_B "cacheB"
+#define CACHE_FILE_C "cacheC"
 #define DOUBLE_MOD (1e+300)
 #define THREAD_NUMS 24
 #define MC 384 //256 + 128
 #define KC 384 //256 + 128
 #define NC 4096
+#define MEMORY_MAX_SIZE 2147483648LL //2G
+#define BC_PANEL_MAX_SIZE 536870912LL //256M < MEMORY_MAX_SIZE/6
 
 #define MR 4
 #define NR 4
@@ -284,11 +289,8 @@ double sumMatirx(FT M[restrict], int m, int n)
 
 }
 
-
-int main()
+void process_in_memory(int n)
 {
-
-	int n = 8192;
 	int i;
 	int loopcnt = 1;
 	double tc, tc2;
@@ -331,6 +333,107 @@ int main()
 	_mm_free(A);
 	_mm_free(B);
 	_mm_free(C);
+
+}
+
+void init_matrix_rectangle(FT M[restrict], int m, int n, int flag)
+{
+	double random_seed = 0.0;
+	long long j;
+	long long size = (long)m * (long)n;
+	if(flag)
+	{
+		#pragma vector aligned
+		for(j = 0; j < size; ++j)
+		{
+			M[j] = 1.0 + random_seed;
+		}
+	}
+	else
+	{
+		#pragma vector aligned
+		for(j = 0; j < size; ++j)
+		{
+			M[j] = 0.0;
+		}
+	}
+}
+
+void init_matrix_disk(FT A[restrict], FT B[restrict], FT C[restrict], FILE* a, FILE* b, int n, int WBC, int WA)
+{
+	#pragma omp parallel sections num_threads(3)
+	{
+		#pragma omp section
+		{
+			int i, j, wc;
+			int wb = (n+WA-1)/WA, rw = n % WA;
+			for(j = 0; j < wb; ++j)
+			{
+				wc = (j != wb - 1 || !rw) ? WA : rw;
+				init_matrix_rectangle(A, n, wc, 1);
+				fwrite((void*)A, sizeof(char), (long)n*(long)wc*sizeof(FT), a);
+			}
+			fflush(a);
+		}
+		#pragma omp section
+		{
+			int i, j, wc;
+			int wb = (n+WBC-1)/WBC, rw = n % WBC;
+			for(j = 0; j < wb; ++j)
+			{
+				wc = (j != wb - 1 || !rw) ? WBC : rw;
+				init_matrix_rectangle(B, n, wc, 1);
+				fwrite((void*)B, sizeof(char), (long)n*(long)wc*sizeof(FT), b);
+			}
+			fflush(b);
+		}
+		#pragma omp section
+		{
+			init_matrix_rectangle(C, n, WBC, 0);
+		}
+	}
+
+#ifdef
+	printf(">> Finish initializing matrix A, B, C\n");
+#endif
+
+}
+
+void process_out_of_memory(int n)
+{
+	int iw, wbc;
+
+	int max_w = BC_PANEL_MAX_SIZE / 8 / n;
+	int WBC = (max_w > NC) ? (max_w/NC)*NC : max_w;// width of panel of B/C
+	int wb = (n+WBC-1)/WBC, rw = n % WBC;
+
+	int WA = (WBC/KC)*KC; //WA should be divided by KC
+
+
+	PFT A = _mm_malloc(2*WA*n*sizeof(FT), 32);
+	PFT B = _mm_malloc(2*WBC*n*sizeof(FT), 32);
+	PFT C = _mm_malloc(2*WBC*n*sizeof(FT), 32);
+	//init matrix
+	FILE* fa = fopen(CACHE_FILE_A, "wb");
+	FILE* fb = fopen(CACHE_FILE_B, "wb");
+	FILE* fb = fopen(CACHE_FILE_C, "wb");
+	init_matrix_disk(A, B, C, fa, fb, n, WBC, WA);
+
+	//reopen with mode read 
+	fa = fopen(CACHE_FILE_A, "rb");
+	fb = fopen(CACHE_FILE_B, "rb");
+
+	for(iw = 0;iw < wb; ++iw)
+	{
+		wbc = (iw != wb-1 || !rw) ? WBC : rw;
+
+	}
+}
+
+int main()
+{
+
+	int n = 8192;
 
 
 	return 0;
