@@ -25,7 +25,8 @@ typedef double* PFT;
 #define KC 384 //256 + 128
 #define NC 4096
 #define MEMORY_MAX_SIZE 2147483648LL //2G
-#define BC_PANEL_MAX_SIZE 536870912LL //256M < MEMORY_MAX_SIZE/6
+//#define BC_PANEL_MAX_SIZE 536870912LL //256M < MEMORY_MAX_SIZE/6
+#define BC_PANEL_MAX_SIZE 268435456LL
 
 #define MR 4
 #define NR 4
@@ -393,7 +394,7 @@ void process_in_memory(int n)
 
 void init_matrix_rectangle(FT M[restrict], int m, int n, int flag)
 {
-	double random_seed = 0.0;
+	double random_seed = 1.0;
 	long long j;
 	long long size = (long)m * (long)n;
 	if(flag)
@@ -401,7 +402,7 @@ void init_matrix_rectangle(FT M[restrict], int m, int n, int flag)
 		#pragma vector aligned
 		for(j = 0; j < size; ++j)
 		{
-			M[j] = 1.0 + random_seed;
+			M[j] = 1.0 + fmod(j*random_seed, 10);
 		}
 	}
 	else
@@ -522,8 +523,7 @@ void process_out_of_memory(int n)
 			}
 		}
 		offset_B = 1 - offset_B;
-		if(iw > 0)
-			offset_C = 1 - offset_C;
+		offset_C = 1 - offset_C;
 	}
 #ifdef DEBUG
 	printf(">> Finish computing!!!\n");
@@ -532,6 +532,18 @@ void process_out_of_memory(int n)
 
 	//write last panle of matrix
 	write_matrix(&C[WBC*n*offset_C], n, (rw != 0) ? rw : WBC, fc);
+
+
+	fflush(fc);
+	fclose(fa);
+	fclose(fb);
+	fclose(fc);
+
+	_mm_free(A);
+	_mm_free(B);
+	_mm_free(C);
+
+
 }
 
 int main()
@@ -540,6 +552,48 @@ int main()
 	int n = 8192;
 
 	process_out_of_memory(n);
+
+	FILE* f = fopen(CACHE_FILE_C, "rb");
+	PFT PC = _mm_malloc(n*n*sizeof(FT), 32);
+	read_matrix(PC, n, n, f);
+	double checkSum1 = sumMatirx(PC, n, 30);
+	double checkSum2 = sumMatirx(&PC[(n-30)*n], n, 30);
+	_mm_free(PC);
+	fclose(f);
+	
+
+	PFT A = _mm_malloc(n*n*sizeof(FT), 32);
+	PFT B = _mm_malloc(n*n*sizeof(FT), 32);
+	PFT C = _mm_malloc(n*n*sizeof(FT), 32);
+
+	int i, j, wc;
+	int WA = 2*KC;
+	int wb = (n+WA-1)/WA, rw = n % WA;
+	for(j = 0; j < wb; ++j)
+	{
+		wc = (j != wb - 1 || !rw) ? WA : rw;
+		init_matrix_rectangle(&A[j*WA*n], n, wc, 1);
+	}
+	int max_w = BC_PANEL_MAX_SIZE / 8 / n;
+	int WBC = (max_w > NC) ? (max_w/NC)*NC : max_w;// width of panel of B/C
+	wb = (n+WBC-1)/WBC, rw = n % WBC;
+
+	for(j = 0; j < wb; ++j)
+	{
+		wc = (j != wb - 1 || !rw) ? WBC : rw;
+		init_matrix_rectangle(&B[j*WBC*n], n, wc, 1);
+	}
+	init_matrix_rectangle(C, n, n, 0);
+	cblas_dgemm(CblasColMajor, CblasNoTrans, CblasNoTrans, n,n,n, 1.0, A, n, B, n, 0.0, C, n);
+	double checkSum3 = sumMatirx(C, n, 30);
+	double checkSum4 = sumMatirx(&C[(n-30)*n], n, 30);
+	_mm_free(A);
+	_mm_free(B);
+	_mm_free(C);
+
+	printf("sum of disk_process: %.5f %.5f\n", checkSum1, checkSum2);
+	printf("sum of cblas_degemm: %.5f %.5f\n", checkSum3, checkSum4);
+
 
 	return 0;
 }
