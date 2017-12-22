@@ -14,11 +14,13 @@
 typedef double FT;
 typedef double* PFT;
 
+#define DEBUG
+
 #define CACHE_FILE_A "cacheA"
 #define CACHE_FILE_B "cacheB"
 #define CACHE_FILE_C "cacheC"
 #define DOUBLE_MOD (1e+300)
-#define THREAD_NUMS 24
+#define THREAD_NUMS 4
 #define MC 384 //256 + 128
 #define KC 384 //256 + 128
 #define NC 4096
@@ -234,6 +236,59 @@ void mat_mat_mul(FT A[restrict], FT B[restrict], FT C[restrict], const int n)
 
 }
 
+void read_matrix(FT M[restrict], int n, int m, FILE* f)
+{
+	fread((void*)M, sizeof(char), (long)n*(long)m*sizeof(FT), f);
+}
+
+void write_matrix(FT M[restrict], int n, int m, FILE* f)
+{
+	fwrite((void*)M, sizeof(char), (long)n*(long)m*sizeof(FT), f);
+}
+
+void dynamic_mat_mul(FT A[restrict], FT B[restrict], FT C[restrict], int n, int wbc, int WA, int offset_A, FILE* fa)
+{
+	int thread_id = 0;
+	int ic, jc, lc, nc, mc, kc;
+	int nb = (wbc+NC-1)/NC, rn = wbc % NC;
+	int mb = (n + MC-1)/MC, rm = n   % MC;
+	int kb = (n + KC-1)/KC, rk = n   % KC;
+	int offset = offset_A;
+
+	for(jc = 0; jc < nb; ++jc)
+	{
+		nc = (jc != nb-1 || !rn) ? NC : rn;
+		for(lc = 0; lc < kb; ++lc)
+		{
+			kc = (lc != kb-1 || !rk) ? KC : rk;
+			BPanel_kcnc(&B[I(lc*KC, jc*NC, n)], kc, nc, BP, n);
+			#pragma omp parallel num_threads(THREAD_NUMS)
+			{
+				#pragma omp master //read next KC panel of A
+				{
+					if(lc == kb-1 && jc != nb-1)
+						fseek(fa, 0, SEEK_SET);
+					if(jc != nb-1 || lc != kb-1)
+						read_matrix(&A[KC*n*offset], n, ((lc != kb-2 || !rk) ? KC : rk), fa);
+				}
+				#pragma omp for
+				for(ic = 0; ic < mb; ++ic)
+				{
+					thread_id = omp_get_thread_num();
+					mc = (ic != mb-1 || !rm) ? MC : rm;
+					ABlock_mcnc(&A[I(ic*MC, KC*(1-offset), n)], mc, kc, &ABArray[thread_id * MC * KC], n);
+					mat_block_panel(&ABArray[thread_id * MC * KC], BP, &C[I(ic*MC, jc*NC, n)], mc, kc, nc, n);
+				}
+
+			}	
+			
+			offset = 1 - offset;
+
+		}
+	}
+}
+
+
 void print_matrix(PFT A, int n)
 {
 	int i, j;
@@ -393,7 +448,7 @@ void init_matrix_disk(FT A[restrict], FT B[restrict], FT C[restrict], FILE* a, F
 		}
 	}
 
-#ifdef
+#ifdef DEBUG
 	printf(">> Finish initializing matrix A, B, C\n");
 #endif
 
@@ -401,33 +456,82 @@ void init_matrix_disk(FT A[restrict], FT B[restrict], FT C[restrict], FILE* a, F
 
 void process_out_of_memory(int n)
 {
-	int iw, wbc;
+
+	int iw, wbc, offset_A, offset_B, offset_C;
 
 	int max_w = BC_PANEL_MAX_SIZE / 8 / n;
 	int WBC = (max_w > NC) ? (max_w/NC)*NC : max_w;// width of panel of B/C
 	int wb = (n+WBC-1)/WBC, rw = n % WBC;
+#ifdef DEBUG
+	printf("max_w:%d, WBC:%d, wb:%d\n", max_w, WBC, wb);
+#endif
 
-	int WA = (WBC/KC)*KC; //WA should be divided by KC
+	//int WA = (WBC/KC)*KC; //WA should be divided by KC
+	int WA = 2*KC;// for simple
 
 
 	PFT A = _mm_malloc(2*WA*n*sizeof(FT), 32);
 	PFT B = _mm_malloc(2*WBC*n*sizeof(FT), 32);
 	PFT C = _mm_malloc(2*WBC*n*sizeof(FT), 32);
+	offset_A = 1;
+	offset_B = 1;
+	offset_C = 1;
 	//init matrix
 	FILE* fa = fopen(CACHE_FILE_A, "wb");
 	FILE* fb = fopen(CACHE_FILE_B, "wb");
-	FILE* fb = fopen(CACHE_FILE_C, "wb");
+	FILE* fc = fopen(CACHE_FILE_C, "wb");
 	init_matrix_disk(A, B, C, fa, fb, n, WBC, WA);
 
+	//close fa, fb
+	fclose(fa);
+	fclose(fb);
 	//reopen with mode read 
 	fa = fopen(CACHE_FILE_A, "rb");
 	fb = fopen(CACHE_FILE_B, "rb");
 
+	//open nested thread
+	omp_set_nested(1);
 	for(iw = 0;iw < wb; ++iw)
 	{
 		wbc = (iw != wb-1 || !rw) ? WBC : rw;
-
+#ifdef DEBUG
+		printf("iw/wb:%d/%d, wbc:%d, offset_A:%d, offset_B:%d, offset_C:%d\n", iw, wb, wbc, offset_A, offset_B, offset_C);
+#endif
+		#pragma omp parallel num_threads(3)
+		{
+			#pragma omp master // read next Panel of B
+			{
+				if(iw < wb-1) // wb = 1
+				{
+					read_matrix(&B[WBC*n*offset_B], n, ((iw != wb-2 || !rw) ? WBC : rw), fb);
+				}
+			}
+			#pragma omp single nowait // write panel of C
+			{
+				if(iw > 0)
+				{
+					write_matrix(&C[WBC*n*offset_C], n, WBC, fc);
+					memset((void*)(&C[WBC*n*offset_C]), 0, WBC*n*sizeof(FT));
+				}
+			}
+			#pragma omp single // computing
+			{
+				fseek(fa, 0, SEEK_SET);
+				read_matrix(A, n, KC, fa);
+				dynamic_mat_mul(A, &B[WBC*n*(1-offset_B)], &C[WBC*n*(1-offset_C)], n, wbc, WA, offset_A, fa);
+			}
+		}
+		offset_B = 1 - offset_B;
+		if(iw > 0)
+			offset_C = 1 - offset_C;
 	}
+#ifdef DEBUG
+	printf(">> Finish computing!!!\n");
+	printf(">> Begin writing last panel of C\n");
+#endif
+
+	//write last panle of matrix
+	write_matrix(&C[WBC*n*offset_C], n, (rw != 0) ? rw : WBC, fc);
 }
 
 int main()
@@ -435,6 +539,7 @@ int main()
 
 	int n = 8192;
 
+	process_out_of_memory(n);
 
 	return 0;
 }
