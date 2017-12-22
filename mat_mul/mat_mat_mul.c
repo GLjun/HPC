@@ -22,7 +22,7 @@ typedef double* PFT;
 #define WRITE_SPEED 2147483648LL // 2G Bytes
 #define MEMORY_SIZE 1073741824LL // 1G
 //#define MEMORY_SIZE 2147483648LL //2G
-#define SWELL_FACTOR 1.1
+#define SWELL_FACTOR 1
 #define WRITE_BLOCK_MAX 2147483647LL
 #define READ_BLOCK_MAX 1073741824LL
 
@@ -56,9 +56,10 @@ typedef struct MatrixDisk {
 static FileCache mat_file_cache = {
 	NULL, NULL, NULL
 };
-static MatrixDisk mat_disk = {
+/*static MatrixDisk mat_disk = {
 	NULL, NULL, NULL, NULL, NULL, NULL
-};
+};*/
+MatrixDisk mat_disk;
 static FT BP[KC * NC] __attribute__ ((aligned (32)));
 static FT ABArray[MC * KC * THREAD_NUMS] __attribute__ ((aligned (32)));
 const char* CACHE_FILE_NAME_A = "cacheA";
@@ -311,7 +312,7 @@ void mat_mat_mul_disk(MatrixDisk* m,  const int n, const int WBC, const int WA)
 					tmp = m->A;
 					m->A = m->A2;
 					m->A2 = tmp;
-					if(!wac) //Since the first time "wac == 0" is included, so we need to exchange B/B2, C/C2 at the beginning
+					if(!jc && !wac) //Since the first time "wac == 0" is included, so we need to exchange B/B2, C/C2 at the beginning
 					{
 						tmp = m->B;
 						m->B = m->B2;
@@ -344,6 +345,11 @@ void mat_mat_mul_disk(MatrixDisk* m,  const int n, const int WBC, const int WA)
 			}
 		}
 	}
+	
+#ifdef PRINT_DEBUG
+	printf("finish calculating one iteration, n:%d, WBC:%d, WA:%d\n", n, WBC, WA);
+#endif
+
 }
 
 void print_matrix(FT A[restrict], int n)
@@ -535,8 +541,11 @@ void matrix_in_memory(int n)
 	//print_matrix(C, n);
 
 	_mm_free(A);
+	A = NULL;
 	_mm_free(B);
+	B = NULL;
 	_mm_free(C);
+	C = NULL;
 
 }
 
@@ -560,14 +569,38 @@ void matrix_in_memory_disk(int n)
 #ifdef PRINT_DEBUG
 	printf("parameters ==> n: %d, WBC: %d, mWb: %d, WA: %d\n\n", n, WBC, mWb, WA);
 #endif
+	MatrixDisk md;
 
-	mat_disk.A = _mm_malloc(WA*n*sizeof(FT), 32);
+	/*mat_disk.A = _mm_malloc(WA*n*sizeof(FT), 32);
 	mat_disk.B = _mm_malloc(WBC*n*sizeof(FT), 32);
 	mat_disk.C = _mm_malloc(WBC*n*sizeof(FT), 32);
 
 	mat_disk.A2 = _mm_malloc(WA*n*sizeof(FT), 32);
 	mat_disk.B2 = _mm_malloc(WBC*n*sizeof(FT), 32);
-	mat_disk.C2 = _mm_malloc(WBC*n*sizeof(FT), 32);
+	mat_disk.C2 = _mm_malloc(WBC*n*sizeof(FT), 32);*/
+	
+	md.A = _mm_malloc(WA*n*sizeof(FT), 32);
+	md.B = _mm_malloc(WBC*n*sizeof(FT), 32);
+	md.C = _mm_malloc(WBC*n*sizeof(FT), 32);
+
+	md.A2 = _mm_malloc(WA*n*sizeof(FT), 32);
+	md.B2 = _mm_malloc(WBC*n*sizeof(FT), 32);
+	md.C2 = _mm_malloc(WBC*n*sizeof(FT), 32);
+#ifdef PRINT_DEBUG
+	printf("init, %p %p %p %p %p %p\n", md.A, md.B, md.C, md.A2, md.B2, md.C2);
+	printf("size, %d %d %d\n", sizeof(md.A), sizeof(md.B), sizeof(md.C));
+#endif
+
+	mat_disk.A = md.A;
+	mat_disk.B = md.B;
+	mat_disk.C = md.C;
+	mat_disk.A2 = md.A2;
+	mat_disk.B2 = md.B2;
+	mat_disk.C2 = md.C2;
+#ifdef PRINT_DEBUG
+	printf("init, %p %p %p %p %p %p\n", mat_disk.A, mat_disk.B, mat_disk.C, mat_disk.A2, mat_disk.B2, mat_disk.C2);
+	printf("size, %d %d %d\n", sizeof(mat_disk.A), sizeof(mat_disk.B), sizeof(mat_disk.C));
+#endif
 
 	init_matrix_disk(&mat_disk, n,WBC,WA);
 	
@@ -583,6 +616,7 @@ void matrix_in_memory_disk(int n)
 	t = mat_disk.C;
 	mat_disk.C = mat_disk.C2;
 	mat_disk.C2 = t;
+
 
 	//open nested
 	omp_set_nested(1);
@@ -600,21 +634,30 @@ void matrix_in_memory_disk(int n)
 				fseek(mat_file_cache.fhB, WBC * n * sizeof(FT), SEEK_SET);
 				//fseek A, go over the first panel WA*n
 				fseek(mat_file_cache.fhA, WA * n * sizeof(FT), SEEK_SET);
-				int i_b, i_c, j, wc, wa, c_in_b2, cc, k;
+				int j, wc, wa, c_in_b2, c_in_c2, cc, k, i_b, i_c;
 				int wb = (n+WBC-1)/WBC, rw = n % WBC;
 				int wab = (n + WA -1 )/WA, rwa = n % WA; //WA must be divided by KC
-				int we = (rwa != 0) ? (WBC + wab - 2) / (wab - 1) : (WBC + wab -1)/wab;
+				//int we = (rwa != 0) ? (WBC + wab - 2) / (wab - 1) : (WBC + wab -1)/wab;
+				int rbbn = wab*2-2; //times of reading panel of panel B
+				int we = (WBC + rbbn - 1)/(rbbn);
+				int nb, i_nb;
+				int run_flag = 1;
 				
 				
+				
+				i_b = 1; // the first B panel to read is 1th
+				i_c = 0; // the first C panel to write is 0th
 
-				i_b = 1; // the index of panel B/C
-				i_c = 0;
 				wc = WBC;
-				c_in_b2= 0;// columns in b2 
+				nb = WBC/NC;// WBC can be divided by NC
+				i_nb = 0;
+
+				c_in_b2 = 0;// columns in b2 
+				c_in_c2 = 0;// columns in c2
 				k = 0;
 				PFT pB = mat_disk.B2;
 				PFT pC = mat_disk.C2;
-				while(i_c < wb-1)
+				while(run_flag)
 				{
 					omp_set_lock(&read_lock);
 					//lock change
@@ -633,7 +676,7 @@ void matrix_in_memory_disk(int n)
 					read_matrix(&mat_disk.A2[READ_A_PANEL_INDEX*WA*n], n, wa, mat_file_cache.fhA, 0);
 
 					//read panel of panel of B to B2 and write panel of panel of C to File
-					if(c_in_b2 < wc) 
+					if(c_in_b2 < wc && READ_A_PANEL_INDEX != wab-1) // do not read/write for the last panel of A
 					{
 						k = (c_in_b2 + we <= wc) ? we : (wc - c_in_b2);
 						if(i_b < wb) // the last iteration do not need read B
@@ -644,31 +687,42 @@ void matrix_in_memory_disk(int n)
 							read_matrix(&mat_disk.B2[c_in_b2*n], n, k, mat_file_cache.fhB, 0);
 
 						}
-						if(i_b > 1) // write C from after the first panel of B being calculated
-						{
-#ifdef PRINT_DEBUG
-							printf("write and memset panel of panel of C, from %d, row:%d, cl:%d, to fileC\n", c_in_b2, n, k);
-#endif
-							write_matrix(&mat_disk.C2[c_in_b2*n], n, k, mat_file_cache.fhC, 0);
-							memset((void*)(&mat_disk.C2[c_in_b2*n]), 0, n*k*sizeof(FT));
-							
-						}
 						c_in_b2 += k;
 						
+					}
+					if(c_in_c2 < WBC && READ_A_PANEL_INDEX != wab-1 && i_b > 1)
+					{
+						k = (c_in_c2 + we < WBC) ? we : (WBC - c_in_c2);
+#ifdef PRINT_DEBUG
+						printf("write and memset panel of panel of C, from %d, row:%d, cl:%d, to fileC\n", c_in_c2, n, k);
+#endif
+						write_matrix(&mat_disk.C2[c_in_c2*n], n, k, mat_file_cache.fhC, 0);
+						memset((void*)(&mat_disk.C2[c_in_c2*n]), 0, n*k*sizeof(FT));
+						c_in_c2 += k;
 					}
 
 					
 
 					if(READ_A_PANEL_INDEX == 0)
 					{
-						if(i_b > 1)
-							++ i_c;
-						++ i_b;
-						wc = (i_b != wb -1 || !rw) ? WBC : rw;
-						c_in_b2 = 0;
+						++ i_nb;// finish reading one A 
+						if(i_nb == nb)
+						{
+							if(i_b > 1)
+								++i_c;
+							++ i_b;
+							wc = (i_b != wb -1 || !rw) ? WBC : rw;
+							c_in_b2 = 0;
+							c_in_c2 = 0;
+							i_nb = 0;
 #ifdef PRINT_DEBUG
-						printf("next iteration, i_b/wb: %d/%d, wc: %d\n", i_b, wb, wc);
+							printf("next iteration, i_c:%d, i_b/wb: %d/%d, wc: %d\n", i_c, i_b, wb, wc);
 #endif
+							if(i_c == wb - 1)
+							{
+								run_flag = 0;
+							}
+						}
 					}
 					omp_unset_lock(&change_lock);
 				}
@@ -692,15 +746,20 @@ void matrix_in_memory_disk(int n)
 
 				for(i = 0;i < wb; ++i)
 				{
+					wc = (i != wb-1 || !rw) ? WBC : rw;
 #ifdef PRINT_DEBUG
 					printf("start multiply panel matrix: n:%d, WBC:%d, i/wb: %d/%d\n", n, WBC, i, wb);
 #endif
 					// matrix exchange happened in mat_mat_mul_disk funciton
-					mat_mat_mul_disk(&mat_disk, n, WBC, WA);
+					mat_mat_mul_disk(&mat_disk, n, wc, WA);
 #ifdef PRINT_DEBUG
 					printf("finish multiply panel matrix: n:%d, WBC:%d, i/wb: %d/%d\n", n, WBC, i, wb);
 #endif
 						
+#ifdef PRINT_DEBUG
+	printf("status md, %p %p %p %p %p %p\n", md.A, md.B, md.C, md.A2, md.B2, md.C2);
+	printf("status mt, %p %p %p %p %p %p\n", mat_disk.A, mat_disk.B, mat_disk.C, mat_disk.A2, mat_disk.B2, mat_disk.C2);
+#endif
 				}
 				double tc2 = dsecnd();
 
@@ -710,6 +769,10 @@ void matrix_in_memory_disk(int n)
 
 		}
 	}
+#ifdef PRINT_DEBUG
+	printf("begin write last panel of C\n");
+#endif
+
 	//write last panel C;
 	int lpw = (n % WBC == 0) ? WBC : (n % WBC);
 	write_matrix(mat_disk.C, n, lpw, mat_file_cache.fhC, 0);
@@ -720,14 +783,46 @@ void matrix_in_memory_disk(int n)
 	fclose(mat_file_cache.fhB);
 	fclose(mat_file_cache.fhC);
 
+#ifdef PRINT_DEBUG
+	printf("A: %.1f %.1f %.1f\n", mat_disk.A[0], mat_disk.A[1], mat_disk.A[2]);
+	printf("B: %.1f %.1f %.1f\n", mat_disk.B[0], mat_disk.B[1], mat_disk.B[2]);
+	printf("C: %.1f %.1f %.1f\n", mat_disk.C[0], mat_disk.C[1], mat_disk.C[2]);
+	printf("A2: %.1f %.1f %.1f\n", mat_disk.A2[0], mat_disk.A2[1], mat_disk.A2[2]);
+	printf("B2: %.1f %.1f %.1f\n", mat_disk.B2[0], mat_disk.B2[1], mat_disk.B2[2]);
+	printf("C2: %.1f %.1f %.1f\n", mat_disk.C2[0], mat_disk.C2[1], mat_disk.C2[2]);
+#endif
 
-	_mm_free(mat_disk.A);
-	_mm_free(mat_disk.B);
-	_mm_free(mat_disk.C);
+#ifdef PRINT_DEBUG
+	printf("free A, %p %p %p %p %p %p\n", md.A, md.B, md.C, md.A2, md.B2, md.C2);
+#endif
+	_mm_free(md.A);
+	md.A = NULL;
+#ifdef PRINT_DEBUG
+	printf("free B, %p %p %p %p %p %p\n", mat_disk.A, mat_disk.B, mat_disk.C, mat_disk.A2, mat_disk.B2, mat_disk.C2);
+#endif
+	_mm_free(md.B);
+	md.B = NULL;
+#ifdef PRINT_DEBUG
+	printf("free C, %p %p %p %p %p %p\n", mat_disk.A, mat_disk.B, mat_disk.C, mat_disk.A2, mat_disk.B2, mat_disk.C2);
+#endif
+	_mm_free(md.C);
+	md.C = NULL;
+#ifdef PRINT_DEBUG
+	printf("free A2, %p %p %p %p %p %p\n", mat_disk.A, mat_disk.B, mat_disk.C, mat_disk.A2, mat_disk.B2, mat_disk.C2);
+#endif
 	
-	_mm_free(mat_disk.A2);
-	_mm_free(mat_disk.B2);
-	_mm_free(mat_disk.C2);
+	_mm_free(md.A2);
+	md.A2 = NULL;
+#ifdef PRINT_DEBUG
+	printf("free B2, %p %p %p %p %p %p\n", mat_disk.A, mat_disk.B, mat_disk.C, mat_disk.A2, mat_disk.B2, mat_disk.C2);
+#endif
+	_mm_free(md.B2);
+	md.B2 = NULL;
+#ifdef PRINT_DEBUG
+	printf("free C2, %p %p %p %p %p %p\n", mat_disk.A, mat_disk.B, mat_disk.C, mat_disk.A2, mat_disk.B2, mat_disk.C2);
+#endif
+	_mm_free(md.C2);
+	md.C2 = NULL;
 
 }
 
@@ -744,12 +839,6 @@ int main()
 		omp_init_lock(&read_lock);
 		omp_init_lock(&change_lock);
 		matrix_in_memory_disk(n);
-		if(mat_file_cache.fhA)
-			fclose(mat_file_cache.fhA);
-		if(mat_file_cache.fhB)
-			fclose(mat_file_cache.fhB);
-		if(mat_file_cache.fhC)
-			fclose(mat_file_cache.fhC);
 		omp_destroy_lock(&read_lock);
 		omp_destroy_lock(&change_lock);
 	}
